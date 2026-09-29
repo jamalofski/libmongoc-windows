@@ -30,17 +30,42 @@ env:
   MSVC_TOOLSET: "14.44"
   # MongoDB C Driver Release Signing Key (keys/mongo-c-driver.asc, from https://pgp.mongodb.com/c-driver.asc)
   MONGOC_SIGNING_KEY: 6DB55D8223FF44E49DCB981344E76C0565ABC463
-  # OpenSSL 3.5 is the current LTS branch. The tarball signature was checked against the
-  # OpenSSL signing key (B146 647E 45A7 B339 47AB 226B 2A2C 87D1 6169 2D40) before pinning.
-  OPENSSL_VERSION: 3.5.9
-  OPENSSL_SHA256: 603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a
+  # OpenSSL 3.5 is the current LTS branch: each build takes its latest release. Moving to another
+  # branch is a deliberate change, since the OpenSSL DLL names follow the major version.
+  OPENSSL_BRANCH: "3.5"
+  # OpenSSL signing certificate (keys/openssl.asc, from https://openssl-library.org/source/pubkeys.asc)
+  OPENSSL_SIGNING_KEY: B146647E45A7B33947AB226B2A2C87D161692D40
   # Assembler for OpenSSL's optimized code paths; the win64 build also assembles 32-bit objects.
   NASM_VERSION: 2.16.03
   NASM_SHA256: 3ee4782247bcb874378d02f7eab4e294a84d3d15f3f6ee2de2f47a46aa7226e6
 
 jobs:
+  # Resolved once, so that both architectures and the release notes use the same version.
+  openssl:
+    name: find the latest OpenSSL
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.latest.outputs.version }}
+    steps:
+      - id: latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version=$(gh api --paginate 'repos/openssl/openssl/releases?per_page=100' \
+            --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name' \
+            | sed -n 's/^openssl-\([0-9]*\.[0-9]*\.[0-9]*\)$/\1/p' \
+            | awk -F. -v branch="$OPENSSL_BRANCH" '($1 "." $2) == branch' | sort -V | tail -n 1)
+          if [ -z "$version" ]; then
+            echo "::error::No OpenSSL $OPENSSL_BRANCH release found"
+            exit 1
+          fi
+          echo "OpenSSL $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
   build:
     name: build (${{ matrix.arch }})
+    needs: openssl
     runs-on: windows-2025
     timeout-minutes: 90
     strategy:
@@ -60,6 +85,7 @@ jobs:
             dll-suffix: ""
             machine: 14C machine (x86)
     env:
+      OPENSSL_VERSION: ${{ needs.openssl.outputs.version }}
       ARCH: ${{ matrix.arch }}
       PKG: libmongoc-windows-${{ inputs.mongoc-version }}-${{ matrix.arch }}
       OPENSSL_PREFIX: ${{ github.workspace }}\openssl-dist\${{ matrix.openssl-dir }}
@@ -130,7 +156,21 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: openssl-dist
-          key: openssl-${{ env.OPENSSL_VERSION }}-${{ matrix.arch }}-msvc${{ env.MSVC_TOOLSET }}-1
+          key: openssl-${{ env.OPENSSL_VERSION }}-${{ matrix.arch }}-msvc${{ env.MSVC_TOOLSET }}-2
+
+      - name: Download and verify OpenSSL ${{ env.OPENSSL_VERSION }}
+        if: steps.openssl-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          tarball="openssl-$OPENSSL_VERSION.tar.gz"
+          url="https://github.com/openssl/openssl/releases/download/openssl-$OPENSSL_VERSION/$tarball"
+          curl -fsSL -o "$tarball" "$url"
+          curl -fsSL -o "$tarball.asc" "$url.asc"
+          export GNUPGHOME="$(mktemp -d)"
+          gpg --batch --quiet --import keys/openssl.asc
+          gpg --batch --status-fd 1 --verify "$tarball.asc" "$tarball" > gpg-openssl.txt
+          grep -Eq "^\[GNUPG:\] VALIDSIG .*$OPENSSL_SIGNING_KEY\$" gpg-openssl.txt
 
       - name: Build OpenSSL ${{ env.OPENSSL_VERSION }}
         if: steps.openssl-cache.outputs.cache-hit != 'true'
@@ -145,11 +185,8 @@ jobs:
           Expand-Archive $nasmZip -DestinationPath $tmp
           $env:PATH = "$tmp\nasm-$env:NASM_VERSION;$env:PATH"
 
-          $tarball = Join-Path $tmp "openssl-$env:OPENSSL_VERSION.tar.gz"
-          Invoke-WebRequest "https://github.com/openssl/openssl/releases/download/openssl-$env:OPENSSL_VERSION/openssl-$env:OPENSSL_VERSION.tar.gz" -OutFile $tarball
-          if ((Get-FileHash $tarball -Algorithm SHA256).Hash -ne $env:OPENSSL_SHA256) { throw 'OpenSSL checksum mismatch' }
           # Windows tar: Git's GNU tar would read "D:" as a remote host.
-          & "$env:SystemRoot\System32\tar.exe" -xzf $tarball -C $tmp
+          & "$env:SystemRoot\System32\tar.exe" -xzf "openssl-$env:OPENSSL_VERSION.tar.gz" -C $tmp
 
           # OpenSSL needs a native Windows Perl, not the MSYS one that comes with Git.
           $perl = 'C:\Strawberry\perl\bin\perl.exe'
@@ -332,7 +369,7 @@ jobs:
           if-no-files-found: error
 
   release:
-    needs: build
+    needs: [openssl, build]
     if: inputs.publish
     runs-on: ubuntu-latest
     permissions:
@@ -342,6 +379,7 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       TAG: v${{ inputs.mongoc-version }}
+      OPENSSL_VERSION: ${{ needs.openssl.outputs.version }}
     steps:
       - name: Check the repository is public
         run: |

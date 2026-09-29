@@ -58,7 +58,7 @@ gh attestation verify mongoc2.dll --repo jamalofski/libmongoc-windows
 [`build.yml`](.github/workflows/build.yml) runs on a GitHub-hosted `windows-2025` runner, with the MSVC 14.44 toolset from Visual Studio 2022 17.14:
 
 1. It downloads the mongo-c-driver release and checks its signature against the [MongoDB C Driver release key](keys/mongo-c-driver.asc) (`6DB5 5D82 23FF 44E4 9DCB 9813 44E7 6C05 65AB C463`).
-2. It builds OpenSSL from the official source tarball, whose SHA-256 is pinned in the workflow, with OpenSSL's default Windows directories.
+2. It builds OpenSSL from the latest 3.5 LTS release, after checking the tarball signature against the [OpenSSL signing certificate](keys/openssl.asc) (`B146 647E 45A7 B339 47AB 226B 2A2C 87D1 6169 2D40`), with OpenSSL's default Windows directories.
 3. It builds libbson and libmongoc with `ENABLE_SSL=OPENSSL`, `ENABLE_SASL=SSPI`, `ENABLE_SRV=ON`, `ENABLE_ZLIB=BUNDLED`, `ENABLE_MONGODB_AWS_AUTH=ON`, `ENABLE_SNAPPY=OFF`, `ENABLE_ZSTD=OFF` and `ENABLE_CLIENT_SIDE_ENCRYPTION=OFF`. On 1.x it adds `BSON_OUTPUT_BASENAME=libbson` and `MONGOC_OUTPUT_BASENAME=libmongoc`.
 4. It checks the architecture and version of every DLL, and that each dependency is either in the package or part of Windows.
 5. It compiles a [smoke test](test/smoke.c) and runs it with only the package and Windows on the DLL search path, against a local `mongod` that requires TLS and a client certificate.
@@ -68,6 +68,8 @@ gh attestation verify mongoc2.dll --repo jamalofski/libmongoc-windows
 ## Versions
 
 Release tags follow upstream: `v2.5.5` is mongo-c-driver 2.5.5 and `v1.30.12` is mongo-c-driver 1.30.12. Each release lists the OpenSSL and compiler versions it was built with.
+
+Only new mongo-c-driver releases trigger a build, and each build takes the latest OpenSSL 3.5 release available at that time. A new OpenSSL release on its own does not produce a new package.
 
 ## License
 
