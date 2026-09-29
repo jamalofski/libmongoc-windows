@@ -1,0 +1,53 @@
+name: check upstream
+
+on:
+  schedule:
+    # Thursdays: upstream patch releases have been landing on Wednesdays.
+    - cron: "23 6 * * 4"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
+    outputs:
+      version: ${{ steps.latest.outputs.version }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Find the latest upstream 1.x release
+        id: latest
+        run: |
+          set -euo pipefail
+          latest=$(gh api --paginate 'repos/mongodb/mongo-c-driver/releases?per_page=100' \
+            --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name' \
+            | grep -E '^1\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1)
+          echo "Latest upstream 1.x release: $latest"
+          if [ "$(gh api "repos/$GITHUB_REPOSITORY" --jq .private)" != "false" ]; then
+            echo "::notice::The repository is private: nothing is published."
+          elif gh release view "v$latest" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "v$latest is already published."
+          else
+            echo "version=$latest" >> "$GITHUB_OUTPUT"
+          fi
+
+      # GitHub disables scheduled workflows after 60 days without repository activity.
+      - name: Keep the schedule enabled
+        run: gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/check.yml/enable"
+
+  build:
+    needs: check
+    if: needs.check.outputs.version != ''
+    uses: ./.github/workflows/build.yml
+    with:
+      mongoc-version: ${{ needs.check.outputs.version }}
+      publish: true
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write

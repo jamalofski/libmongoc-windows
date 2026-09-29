@@ -1,0 +1,368 @@
+name: build
+
+on:
+  workflow_dispatch:
+    inputs:
+      mongoc-version:
+        description: mongo-c-driver version to build (1.x, for example 1.30.12)
+        required: true
+        type: string
+      publish:
+        description: Publish a GitHub release (public repository only)
+        type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      mongoc-version:
+        required: true
+        type: string
+      publish:
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  MONGOC_VERSION: ${{ inputs.mongoc-version }}
+  # MongoDB C Driver Release Signing Key (keys/mongo-c-driver.asc, from https://pgp.mongodb.com/c-driver.asc)
+  MONGOC_SIGNING_KEY: 6DB55D8223FF44E49DCB981344E76C0565ABC463
+  # OpenSSL 3.5 is the current LTS branch. The tarball signature was checked against the
+  # OpenSSL signing key (B146 647E 45A7 B339 47AB 226B 2A2C 87D1 6169 2D40) before pinning.
+  OPENSSL_VERSION: 3.5.9
+  OPENSSL_SHA256: 603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a
+  # Assembler for OpenSSL's optimized code paths; the win64 build also assembles 32-bit objects.
+  NASM_VERSION: 2.16.03
+  NASM_SHA256: 3ee4782247bcb874378d02f7eab4e294a84d3d15f3f6ee2de2f47a46aa7226e6
+
+jobs:
+  build:
+    name: build (${{ matrix.arch }})
+    runs-on: windows-2025
+    timeout-minutes: 90
+    strategy:
+      matrix:
+        include:
+          - arch: x64
+            vcvars: x64
+            cmake-platform: x64
+            openssl-target: VC-WIN64A
+            openssl-dir: Program Files\OpenSSL
+            dll-suffix: -x64
+            machine: 8664 machine (x64)
+          - arch: x86
+            vcvars: x86
+            cmake-platform: Win32
+            openssl-target: VC-WIN32
+            openssl-dir: Program Files (x86)\OpenSSL
+            dll-suffix: ""
+            machine: 14C machine (x86)
+    env:
+      ARCH: ${{ matrix.arch }}
+      PKG: libmongoc-windows-${{ inputs.mongoc-version }}-${{ matrix.arch }}
+      OPENSSL_PREFIX: ${{ github.workspace }}\openssl-dist\${{ matrix.openssl-dir }}
+      SSL_DLL: libssl-3${{ matrix.dll-suffix }}.dll
+      CRYPTO_DLL: libcrypto-3${{ matrix.dll-suffix }}.dll
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check the requested version
+        run: |
+          if ($env:MONGOC_VERSION -notmatch '^1\.\d+\.\d+$') {
+            throw "Expected a 1.x version such as 1.30.12, got '$env:MONGOC_VERSION'"
+          }
+
+      - name: Set up MSVC (${{ matrix.vcvars }})
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw 'Visual Studio with the C++ tools was not found' }
+          $before = @{}
+          Get-ChildItem env: | ForEach-Object { $before[$_.Name] = $_.Value }
+          # Export what vcvarsall changes, so that later steps get cl, nmake and dumpbin.
+          # Platform is left out: MSBuild would pick it up and fight CMake's -A option.
+          cmd /c "`"$vs\VC\Auxiliary\Build\vcvarsall.bat`" ${{ matrix.vcvars }} >nul && set" | ForEach-Object {
+            if ($_ -match '^([^=]+)=(.*)$' -and $matches[1] -ne 'Platform' -and $before[$matches[1]] -ne $matches[2]) {
+              "$($matches[1])=$($matches[2])" >> $env:GITHUB_ENV
+            }
+          }
+          $display = & $vswhere -latest -products * -property catalog_productDisplayVersion
+          "VS_DISPLAY_VERSION=$display" >> $env:GITHUB_ENV
+
+      - name: Download and verify mongo-c-driver ${{ inputs.mongoc-version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tarball="mongo-c-driver-$MONGOC_VERSION.tar.gz"
+          url="https://github.com/mongodb/mongo-c-driver/releases/download/$MONGOC_VERSION/$tarball"
+          curl -fsSL -o "$tarball" "$url"
+          curl -fsSL -o "$tarball.asc" "$url.asc"
+          export GNUPGHOME="$(mktemp -d)"
+          gpg --batch --quiet --import keys/mongo-c-driver.asc
+          gpg --batch --status-fd 1 --verify "$tarball.asc" "$tarball" > gpg-status.txt
+          grep -Eq "^\[GNUPG:\] VALIDSIG .*$MONGOC_SIGNING_KEY\$" gpg-status.txt
+          tar -xzf "$tarball"
+
+      - name: Restore OpenSSL ${{ env.OPENSSL_VERSION }}
+        id: openssl-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: openssl-dist
+          key: openssl-${{ env.OPENSSL_VERSION }}-${{ matrix.arch }}-1
+
+      - name: Build OpenSSL ${{ env.OPENSSL_VERSION }}
+        if: steps.openssl-cache.outputs.cache-hit != 'true'
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $ProgressPreference = 'SilentlyContinue'
+          $tmp = $env:RUNNER_TEMP
+
+          $nasmZip = Join-Path $tmp 'nasm.zip'
+          Invoke-WebRequest "https://www.nasm.us/pub/nasm/releasebuilds/$env:NASM_VERSION/win64/nasm-$env:NASM_VERSION-win64.zip" -OutFile $nasmZip
+          if ((Get-FileHash $nasmZip -Algorithm SHA256).Hash -ne $env:NASM_SHA256) { throw 'NASM checksum mismatch' }
+          Expand-Archive $nasmZip -DestinationPath $tmp
+          $env:PATH = "$tmp\nasm-$env:NASM_VERSION;$env:PATH"
+
+          $tarball = Join-Path $tmp "openssl-$env:OPENSSL_VERSION.tar.gz"
+          Invoke-WebRequest "https://github.com/openssl/openssl/releases/download/openssl-$env:OPENSSL_VERSION/openssl-$env:OPENSSL_VERSION.tar.gz" -OutFile $tarball
+          if ((Get-FileHash $tarball -Algorithm SHA256).Hash -ne $env:OPENSSL_SHA256) { throw 'OpenSSL checksum mismatch' }
+          # Windows tar: Git's GNU tar would read "D:" as a remote host.
+          & "$env:SystemRoot\System32\tar.exe" -xzf $tarball -C $tmp
+
+          # OpenSSL needs a native Windows Perl, not the MSYS one that comes with Git.
+          $perl = 'C:\Strawberry\perl\bin\perl.exe'
+          if (-not (Test-Path $perl)) { throw "Strawberry Perl not found at $perl" }
+          # Default install directories (Program Files, Common Files\SSL): they are baked into
+          # the DLLs and are only writable by administrators. DESTDIR stages the files here.
+          Push-Location (Join-Path $tmp "openssl-$env:OPENSSL_VERSION")
+          & $perl Configure ${{ matrix.openssl-target }} no-docs no-tests no-makedepend
+          nmake /nologo
+          nmake /nologo install_sw "DESTDIR=$env:GITHUB_WORKSPACE\openssl-dist"
+          Copy-Item LICENSE.txt $env:OPENSSL_PREFIX
+          Pop-Location
+
+      # Saved right away rather than at the end of the job, so a later failure does not
+      # throw away a 15-minute build.
+      - name: Save OpenSSL ${{ env.OPENSSL_VERSION }}
+        if: steps.openssl-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: openssl-dist
+          key: ${{ steps.openssl-cache.outputs.cache-primary-key }}
+
+      - name: Build mongo-c-driver
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          cmake -S "mongo-c-driver-$env:MONGOC_VERSION" -B build -G 'Visual Studio 17 2022' -A ${{ matrix.cmake-platform }} `
+            -DBSON_OUTPUT_BASENAME=libbson `
+            -DMONGOC_OUTPUT_BASENAME=libmongoc `
+            -DENABLE_SSL=OPENSSL `
+            "-DOPENSSL_ROOT_DIR=$env:OPENSSL_PREFIX" `
+            -DENABLE_SASL=SSPI `
+            -DENABLE_SRV=ON `
+            -DENABLE_ZLIB=BUNDLED `
+            -DENABLE_SNAPPY=OFF `
+            -DENABLE_ZSTD=OFF `
+            -DENABLE_CLIENT_SIDE_ENCRYPTION=OFF `
+            -DENABLE_MONGODB_AWS_AUTH=ON `
+            -DENABLE_STATIC=OFF `
+            -DENABLE_TESTS=OFF `
+            -DENABLE_EXAMPLES=OFF `
+            -DENABLE_UNINSTALL=OFF | Tee-Object -FilePath cmake-configure.log
+          # The runner has other OpenSSL installations (system, Strawberry Perl): make sure ours was used.
+          if (-not (Select-String -Path cmake-configure.log -SimpleMatch "version `"$env:OPENSSL_VERSION`"" -Quiet)) {
+            throw "CMake did not pick up OpenSSL $env:OPENSSL_VERSION from $env:OPENSSL_PREFIX"
+          }
+          cmake --build build --config Release --parallel
+          cmake --install build --config Release --prefix stage
+
+      - name: Assemble the package
+        run: |
+          $pkg = "pkg\$env:PKG"
+          New-Item -ItemType Directory "$pkg\bin", "$pkg\licenses\mongo-c-driver", "$pkg\licenses\openssl" -Force | Out-Null
+          Copy-Item stage\bin\libbson-1.0.dll, stage\bin\libmongoc-1.0.dll "$pkg\bin"
+          Copy-Item "$env:OPENSSL_PREFIX\bin\$env:SSL_DLL", "$env:OPENSSL_PREFIX\bin\$env:CRYPTO_DLL" "$pkg\bin"
+          Copy-Item stage\include "$pkg\include" -Recurse
+          Copy-Item stage\lib "$pkg\lib" -Recurse
+          Copy-Item stage\share\mongo-c-driver\COPYING, stage\share\mongo-c-driver\THIRD_PARTY_NOTICES "$pkg\licenses\mongo-c-driver"
+          Copy-Item "$env:OPENSSL_PREFIX\LICENSE.txt" "$pkg\licenses\openssl"
+          Write-Host 'Installed by mongo-c-driver:'
+          Get-ChildItem stage -Recurse -File | ForEach-Object { '  ' + $_.FullName.Substring((Resolve-Path stage).Path.Length + 1) }
+
+      - name: Check the package
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $bin = "pkg\$env:PKG\bin"
+          $shipped = (Get-ChildItem $bin -Filter *.dll).Name
+          $windows = if ($env:ARCH -eq 'x86') { "$env:SystemRoot\SysWOW64" } else { "$env:SystemRoot\System32" }
+          foreach ($dll in Get-ChildItem $bin -Filter *.dll) {
+            $headers = dumpbin /nologo /headers $dll.FullName
+            if (-not ($headers -match [regex]::Escape('${{ matrix.machine }}'))) { throw "$($dll.Name) is not ${{ matrix.machine }}" }
+            $deps = @(dumpbin /nologo /dependents $dll.FullName | Where-Object { $_ -match '^\s+\S+\.dll$' } | ForEach-Object { $_.Trim() })
+            Write-Host "$($dll.Name) ($($dll.VersionInfo.ProductVersion)) -> $($deps -join ', ')"
+            foreach ($dep in $deps) {
+              if ($shipped -contains $dep -or $dep -like 'api-ms-win-*' -or (Test-Path (Join-Path $windows $dep))) { continue }
+              throw "$($dll.Name) depends on $dep, which is neither in the package nor part of Windows"
+            }
+            if ($dll.Name -eq 'libmongoc-1.0.dll') {
+              foreach ($required in 'libbson-1.0.dll', $env:SSL_DLL, $env:CRYPTO_DLL) {
+                if ($deps -notcontains $required) { throw "libmongoc-1.0.dll does not import $required" }
+              }
+            }
+          }
+          foreach ($name in 'libbson-1.0.dll', 'libmongoc-1.0.dll') {
+            $version = (Get-Item "$bin\$name").VersionInfo.ProductVersion
+            if ($version -ne $env:MONGOC_VERSION) { throw "$name reports version $version" }
+          }
+          foreach ($name in $env:SSL_DLL, $env:CRYPTO_DLL) {
+            $version = (Get-Item "$bin\$name").VersionInfo.ProductVersion
+            if ($version -ne $env:OPENSSL_VERSION) { throw "$name reports version $version" }
+          }
+
+      - name: Create TLS test certificates
+        shell: bash
+        run: |
+          set -euo pipefail
+          export MSYS_NO_PATHCONV=1
+          mkdir tls && cd tls
+          openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj "/CN=libmongoc-windows test CA" \
+            -keyout ca.key -out ca.pem \
+            -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign,cRLSign"
+          issue() { # name, extended key usage, [subjectAltName]
+            openssl req -newkey rsa:2048 -nodes -subj "/CN=$1" -keyout "$1.key" -out "$1.csr"
+            {
+              echo "basicConstraints=CA:FALSE"
+              echo "keyUsage=critical,digitalSignature,keyEncipherment"
+              echo "extendedKeyUsage=$2"
+              if [ -n "${3:-}" ]; then echo "subjectAltName=$3"; fi
+            } > "$1.ext"
+            openssl x509 -req -in "$1.csr" -CA ca.pem -CAkey ca.key -CAcreateserial -days 2 -sha256 -extfile "$1.ext" -out "$1.crt"
+            # PKCS#1 key: mongod on Windows reads PEM through SChannel.
+            openssl pkey -in "$1.key" -traditional -out "$1.rsa.key"
+            cat "$1.crt" "$1.rsa.key" > "$1.pem"
+          }
+          issue server serverAuth "DNS:localhost,IP:127.0.0.1"
+          issue client clientAuth
+
+      - name: Smoke test (mutual TLS against mongod)
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $pkg = (Resolve-Path "pkg\$env:PKG").Path
+          $tls = (Resolve-Path tls).Path -replace '\\', '/'
+          $smoke = Join-Path $env:RUNNER_TEMP 'smoke'
+          New-Item -ItemType Directory $smoke -Force | Out-Null
+          Copy-Item "$pkg\bin\*.dll" $smoke
+          Push-Location $smoke
+          cl /nologo /W3 /std:c11 "/I$pkg\include\libbson-1.0" "/I$pkg\include\libmongoc-1.0" "$env:GITHUB_WORKSPACE\test\smoke.c" `
+            /link "/LIBPATH:$pkg\lib" libmongoc-1.0.lib libbson-1.0.lib
+
+          $mongod = Get-ChildItem 'C:\Program Files\MongoDB\Server\*\bin\mongod.exe' | Sort-Object FullName | Select-Object -Last 1
+          if (-not $mongod) { throw 'mongod was not found on the runner' }
+          $data = Join-Path $env:RUNNER_TEMP 'mongo-data'
+          $log = Join-Path $env:RUNNER_TEMP 'mongod.log'
+          New-Item -ItemType Directory $data -Force | Out-Null
+          # A client certificate is required: tlsCAFile without tlsAllowConnectionsWithoutCertificates.
+          $server = Start-Process $mongod.FullName -PassThru -NoNewWindow -ArgumentList @(
+            '--dbpath', $data, '--port', '27018', '--bind_ip', '127.0.0.1', '--logpath', $log,
+            '--tlsMode', 'requireTLS', '--tlsCertificateKeyFile', "$tls/server.pem", '--tlsCAFile', "$tls/ca.pem")
+          try {
+            $deadline = (Get-Date).AddSeconds(60)
+            while ($true) {
+              try { [Net.Sockets.TcpClient]::new('127.0.0.1', 27018).Dispose(); break }
+              catch { if ((Get-Date) -gt $deadline) { throw 'mongod did not start' }; Start-Sleep -Seconds 1 }
+            }
+            # Only the package and Windows on the DLL search path: the package has to be self-contained.
+            $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
+            .\smoke.exe $env:MONGOC_VERSION "mongodb://127.0.0.1:27018/?tls=true&tlsCAFile=$tls/ca.pem&tlsCertificateKeyFile=$tls/client.pem&serverSelectionTimeoutMS=20000"
+          } catch {
+            if (Test-Path $log) { Get-Content $log -Tail 40 }
+            throw
+          } finally {
+            Stop-Process -Id $server.Id -ErrorAction SilentlyContinue
+            Pop-Location
+          }
+
+      - name: Zip
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          New-Item -ItemType Directory dist -Force | Out-Null
+          Push-Location pkg
+          7z a -tzip -mx=9 "..\dist\$env:PKG.zip" $env:PKG | Out-Null
+          Pop-Location
+          "Visual Studio 2022 $env:VS_DISPLAY_VERSION (MSVC $env:VCToolsVersion), GitHub runner image $env:ImageOS $env:ImageVersion" |
+            Set-Content "dist\toolchain-$env:ARCH.txt"
+          Get-ChildItem dist | Format-Table Name, Length
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ env.PKG }}
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: inputs.publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: v${{ inputs.mongoc-version }}
+    steps:
+      - name: Check the repository is public
+        run: |
+          # Artifact attestations are only available to public repositories on this plan.
+          if [ "$(gh api "repos/$GITHUB_REPOSITORY" --jq .private)" != "false" ]; then
+            echo "::error::Releases are only published from the public repository."
+            exit 1
+          fi
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: libmongoc-windows-*
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum libmongoc-windows-*.zip > SHA256SUMS
+          cat SHA256SUMS
+          for zip in libmongoc-windows-*.zip; do
+            name="${zip%.zip}"
+            unzip -q "$zip" "$name/bin/*.dll" -d ../dlls
+          done
+
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/libmongoc-windows-*.zip
+            dlls/**/*.dll
+
+      - name: Publish the release
+        run: |
+          set -euo pipefail
+          {
+            echo "Unofficial Windows build of [mongo-c-driver $MONGOC_VERSION](https://github.com/mongodb/mongo-c-driver/releases/tag/$MONGOC_VERSION), for x64 and x86."
+            echo
+            echo "- OpenSSL $OPENSSL_VERSION"
+            echo "- $(cat dist/toolchain-x64.txt)"
+            echo
+            echo "Copy the four DLLs from \`bin/\` next to your executable. The [README](https://github.com/$GITHUB_REPOSITORY#readme) lists the requirements and how to verify the files:"
+            echo
+            echo '```sh'
+            echo 'sha256sum -c SHA256SUMS'
+            echo "gh attestation verify libmongoc-windows-$MONGOC_VERSION-x64.zip --repo $GITHUB_REPOSITORY"
+            echo '```'
+          } > notes.md
+          gh release create "$TAG" dist/libmongoc-windows-*.zip dist/SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "libmongoc $MONGOC_VERSION" --notes-file notes.md
