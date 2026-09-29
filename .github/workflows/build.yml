@@ -80,9 +80,12 @@ jobs:
           }
           if ($matches[1] -eq '1') {
             # 1.x keeps the lib-prefixed names that Delphi FireDAC loads (upstream dropped them in 1.16).
-            $names = 'BSON_BASENAME=libbson', 'MONGOC_BASENAME=libmongoc', 'BSON_NAME=libbson-1.0', 'MONGOC_NAME=libmongoc-1.0'
+            $names = 'BSON_BASENAME=libbson', 'MONGOC_BASENAME=libmongoc', 'BSON_NAME=libbson-1.0', 'MONGOC_NAME=libmongoc-1.0',
+                     'BSON_IMPLIB=libbson-1.0.lib', 'MONGOC_IMPLIB=libmongoc-1.0.lib'
           } else {
-            $names = 'BSON_BASENAME=bson', 'MONGOC_BASENAME=mongoc', 'BSON_NAME=bson2', 'MONGOC_NAME=mongoc2'
+            # 2.x names the import libraries *.dll.lib, keeping *.lib for the static libraries.
+            $names = 'BSON_BASENAME=bson', 'MONGOC_BASENAME=mongoc', 'BSON_NAME=bson2', 'MONGOC_NAME=mongoc2',
+                     'BSON_IMPLIB=bson2.dll.lib', 'MONGOC_IMPLIB=mongoc2.dll.lib'
           }
           $names >> $env:GITHUB_ENV
 
@@ -283,7 +286,7 @@ jobs:
           }
           Push-Location $smoke
           cl /nologo /W3 /std:c11 @includes "$env:GITHUB_WORKSPACE\test\smoke.c" `
-            /link "/LIBPATH:$pkg\lib" "$env:MONGOC_NAME.lib" "$env:BSON_NAME.lib"
+            /link "/LIBPATH:$pkg\lib" $env:MONGOC_IMPLIB $env:BSON_IMPLIB
 
           $mongod = Get-ChildItem 'C:\Program Files\MongoDB\Server\*\bin\mongod.exe' | Sort-Object FullName | Select-Object -Last 1
           if (-not $mongod) { throw 'mongod was not found on the runner' }

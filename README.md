@@ -30,7 +30,8 @@ Each zip contains:
 bin/        the two driver DLLs (see above)
             libssl-3-x64.dll, libcrypto-3-x64.dll   (x86: libssl-3.dll, libcrypto-3.dll)
 include/    libbson and libmongoc headers
-lib/        import libraries, CMake and pkg-config files
+lib/        import libraries (1.x: libmongoc-1.0.lib, libbson-1.0.lib; 2.x: mongoc2.dll.lib, bson2.dll.lib),
+            CMake and pkg-config files
 licenses/   mongo-c-driver and its bundled components, OpenSSL
 ```
 
