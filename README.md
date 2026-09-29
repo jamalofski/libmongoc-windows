@@ -47,7 +47,7 @@ gh attestation verify libmongoc-1.0.dll --repo jamalofski/libmongoc-windows
 
 ## How it is built
 
-[`build.yml`](.github/workflows/build.yml) runs on a GitHub-hosted `windows-2025` runner with Visual Studio 2022:
+[`build.yml`](.github/workflows/build.yml) runs on a GitHub-hosted `windows-2025` runner, with the MSVC 14.44 toolset from Visual Studio 2022 17.14:
 
 1. It downloads the mongo-c-driver release and checks its signature against the [MongoDB C Driver release key](keys/mongo-c-driver.asc) (`6DB5 5D82 23FF 44E4 9DCB 9813 44E7 6C05 65AB C463`).
 2. It builds OpenSSL from the official source tarball, whose SHA-256 is pinned in the workflow, with OpenSSL's default Windows directories.

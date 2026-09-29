@@ -25,6 +25,9 @@ permissions:
 
 env:
   MONGOC_VERSION: ${{ inputs.mongoc-version }}
+  # MSVC toolset from Visual Studio 2022 17.14, installed side by side on the runner image.
+  # Pinned so that a runner image update cannot change the compiler (and the runtime it needs).
+  MSVC_TOOLSET: "14.44"
   # MongoDB C Driver Release Signing Key (keys/mongo-c-driver.asc, from https://pgp.mongodb.com/c-driver.asc)
   MONGOC_SIGNING_KEY: 6DB55D8223FF44E49DCB981344E76C0565ABC463
   # OpenSSL 3.5 is the current LTS branch. The tarball signature was checked against the
@@ -41,18 +44,17 @@ jobs:
     runs-on: windows-2025
     timeout-minutes: 90
     strategy:
+      fail-fast: false
       matrix:
         include:
           - arch: x64
             vcvars: x64
-            cmake-platform: x64
             openssl-target: VC-WIN64A
             openssl-dir: Program Files\OpenSSL
             dll-suffix: -x64
             machine: 8664 machine (x64)
           - arch: x86
             vcvars: x86
-            cmake-platform: Win32
             openssl-target: VC-WIN32
             openssl-dir: Program Files (x86)\OpenSSL
             dll-suffix: ""
@@ -77,22 +79,27 @@ jobs:
             throw "Expected a 1.x version such as 1.30.12, got '$env:MONGOC_VERSION'"
           }
 
-      - name: Set up MSVC (${{ matrix.vcvars }})
+      - name: Set up MSVC ${{ env.MSVC_TOOLSET }} (${{ matrix.vcvars }})
         run: |
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
           $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
           if (-not $vs) { throw 'Visual Studio with the C++ tools was not found' }
           $before = @{}
           Get-ChildItem env: | ForEach-Object { $before[$_.Name] = $_.Value }
-          # Export what vcvarsall changes, so that later steps get cl, nmake and dumpbin.
-          # Platform is left out: MSBuild would pick it up and fight CMake's -A option.
-          cmd /c "`"$vs\VC\Auxiliary\Build\vcvarsall.bat`" ${{ matrix.vcvars }} >nul && set" | ForEach-Object {
-            if ($_ -match '^([^=]+)=(.*)$' -and $matches[1] -ne 'Platform' -and $before[$matches[1]] -ne $matches[2]) {
-              "$($matches[1])=$($matches[2])" >> $env:GITHUB_ENV
-            }
+          # Export what vcvarsall changes, so that later steps get cl, nmake, dumpbin and ninja.
+          $vcvars = @{}
+          cmd /c "`"$vs\VC\Auxiliary\Build\vcvarsall.bat`" ${{ matrix.vcvars }} -vcvars_ver=$env:MSVC_TOOLSET >nul && set" | ForEach-Object {
+            if ($_ -match '^([^=]+)=(.*)$') { $vcvars[$matches[1]] = $matches[2] }
+          }
+          if (-not ($vcvars['VCToolsVersion'] -like "$env:MSVC_TOOLSET.*")) {
+            throw "MSVC $env:MSVC_TOOLSET is not installed in $vs"
+          }
+          foreach ($name in $vcvars.Keys) {
+            if ($before[$name] -ne $vcvars[$name]) { "$name=$($vcvars[$name])" >> $env:GITHUB_ENV }
           }
           $display = & $vswhere -latest -products * -property catalog_productDisplayVersion
           "VS_DISPLAY_VERSION=$display" >> $env:GITHUB_ENV
+          Write-Host "MSVC $($vcvars['VCToolsVersion']) from Visual Studio $display"
 
       - name: Download and verify mongo-c-driver ${{ inputs.mongoc-version }}
         shell: bash
@@ -113,7 +120,7 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: openssl-dist
-          key: openssl-${{ env.OPENSSL_VERSION }}-${{ matrix.arch }}-1
+          key: openssl-${{ env.OPENSSL_VERSION }}-${{ matrix.arch }}-msvc${{ env.MSVC_TOOLSET }}-1
 
       - name: Build OpenSSL ${{ env.OPENSSL_VERSION }}
         if: steps.openssl-cache.outputs.cache-hit != 'true'
@@ -158,7 +165,8 @@ jobs:
       - name: Build mongo-c-driver
         run: |
           $PSNativeCommandUseErrorActionPreference = $true
-          cmake -S "mongo-c-driver-$env:MONGOC_VERSION" -B build -G 'Visual Studio 17 2022' -A ${{ matrix.cmake-platform }} `
+          # Ninja with the MSVC environment set up above: independent of the Visual Studio version.
+          cmake -S "mongo-c-driver-$env:MONGOC_VERSION" -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
             -DBSON_OUTPUT_BASENAME=libbson `
             -DMONGOC_OUTPUT_BASENAME=libmongoc `
             -DENABLE_SSL=OPENSSL `
@@ -178,8 +186,8 @@ jobs:
           if (-not (Select-String -Path cmake-configure.log -SimpleMatch "version `"$env:OPENSSL_VERSION`"" -Quiet)) {
             throw "CMake did not pick up OpenSSL $env:OPENSSL_VERSION from $env:OPENSSL_PREFIX"
           }
-          cmake --build build --config Release --parallel
-          cmake --install build --config Release --prefix stage
+          cmake --build build
+          cmake --install build --prefix stage
 
       - name: Assemble the package
         run: |
@@ -294,7 +302,7 @@ jobs:
           Push-Location pkg
           7z a -tzip -mx=9 "..\dist\$env:PKG.zip" $env:PKG | Out-Null
           Pop-Location
-          "Visual Studio 2022 $env:VS_DISPLAY_VERSION (MSVC $env:VCToolsVersion), GitHub runner image $env:ImageOS $env:ImageVersion" |
+          "MSVC $env:VCToolsVersion (Visual Studio $env:VS_DISPLAY_VERSION), GitHub runner image $env:ImageOS $env:ImageVersion" |
             Set-Content "dist\toolchain-$env:ARCH.txt"
           Get-ChildItem dist | Format-Table Name, Length
 
