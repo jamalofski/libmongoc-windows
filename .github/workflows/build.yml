@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       mongoc-version:
-        description: mongo-c-driver version to build (1.x, for example 1.30.12)
+        description: mongo-c-driver version to build, for example 1.30.12 or 2.5.5
         required: true
         type: string
       publish:
@@ -75,9 +75,16 @@ jobs:
 
       - name: Check the requested version
         run: |
-          if ($env:MONGOC_VERSION -notmatch '^1\.\d+\.\d+$') {
-            throw "Expected a 1.x version such as 1.30.12, got '$env:MONGOC_VERSION'"
+          if ($env:MONGOC_VERSION -notmatch '^([12])\.\d+\.\d+$') {
+            throw "Expected a 1.x or 2.x version such as 1.30.12 or 2.5.5, got '$env:MONGOC_VERSION'"
           }
+          if ($matches[1] -eq '1') {
+            # 1.x keeps the lib-prefixed names that Delphi FireDAC loads (upstream dropped them in 1.16).
+            $names = 'BSON_BASENAME=libbson', 'MONGOC_BASENAME=libmongoc', 'BSON_NAME=libbson-1.0', 'MONGOC_NAME=libmongoc-1.0'
+          } else {
+            $names = 'BSON_BASENAME=bson', 'MONGOC_BASENAME=mongoc', 'BSON_NAME=bson2', 'MONGOC_NAME=mongoc2'
+          }
+          $names >> $env:GITHUB_ENV
 
       - name: Set up MSVC ${{ env.MSVC_TOOLSET }} (${{ matrix.vcvars }})
         run: |
@@ -167,8 +174,8 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $true
           # Ninja with the MSVC environment set up above: independent of the Visual Studio version.
           cmake -S "mongo-c-driver-$env:MONGOC_VERSION" -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
-            -DBSON_OUTPUT_BASENAME=libbson `
-            -DMONGOC_OUTPUT_BASENAME=libmongoc `
+            "-DBSON_OUTPUT_BASENAME=$env:BSON_BASENAME" `
+            "-DMONGOC_OUTPUT_BASENAME=$env:MONGOC_BASENAME" `
             -DENABLE_SSL=OPENSSL `
             "-DOPENSSL_ROOT_DIR=$env:OPENSSL_PREFIX" `
             -DENABLE_SASL=SSPI `
@@ -193,11 +200,14 @@ jobs:
         run: |
           $pkg = "pkg\$env:PKG"
           New-Item -ItemType Directory "$pkg\bin", "$pkg\licenses\mongo-c-driver", "$pkg\licenses\openssl" -Force | Out-Null
-          Copy-Item stage\bin\libbson-1.0.dll, stage\bin\libmongoc-1.0.dll "$pkg\bin"
+          Copy-Item "stage\bin\$env:BSON_NAME.dll", "stage\bin\$env:MONGOC_NAME.dll" "$pkg\bin"
           Copy-Item "$env:OPENSSL_PREFIX\bin\$env:SSL_DLL", "$env:OPENSSL_PREFIX\bin\$env:CRYPTO_DLL" "$pkg\bin"
           Copy-Item stage\include "$pkg\include" -Recurse
           Copy-Item stage\lib "$pkg\lib" -Recurse
-          Copy-Item stage\share\mongo-c-driver\COPYING, stage\share\mongo-c-driver\THIRD_PARTY_NOTICES "$pkg\licenses\mongo-c-driver"
+          # share\mongo-c-driver on 1.x, share\mongo-c-driver\<version> on 2.x
+          $notices = Get-ChildItem stage\share\mongo-c-driver -Recurse -Include COPYING, THIRD_PARTY_NOTICES
+          if ($notices.Count -ne 2) { throw 'COPYING and THIRD_PARTY_NOTICES not found in the mongo-c-driver install' }
+          $notices | Copy-Item -Destination "$pkg\licenses\mongo-c-driver"
           Copy-Item "$env:OPENSSL_PREFIX\LICENSE.txt" "$pkg\licenses\openssl"
           Write-Host 'Installed by mongo-c-driver:'
           Get-ChildItem stage -Recurse -File | ForEach-Object { '  ' + $_.FullName.Substring((Resolve-Path stage).Path.Length + 1) }
@@ -217,13 +227,13 @@ jobs:
               if ($shipped -contains $dep -or $dep -like 'api-ms-win-*' -or (Test-Path (Join-Path $windows $dep))) { continue }
               throw "$($dll.Name) depends on $dep, which is neither in the package nor part of Windows"
             }
-            if ($dll.Name -eq 'libmongoc-1.0.dll') {
-              foreach ($required in 'libbson-1.0.dll', $env:SSL_DLL, $env:CRYPTO_DLL) {
-                if ($deps -notcontains $required) { throw "libmongoc-1.0.dll does not import $required" }
+            if ($dll.Name -eq "$env:MONGOC_NAME.dll") {
+              foreach ($required in "$env:BSON_NAME.dll", $env:SSL_DLL, $env:CRYPTO_DLL) {
+                if ($deps -notcontains $required) { throw "$($dll.Name) does not import $required" }
               }
             }
           }
-          foreach ($name in 'libbson-1.0.dll', 'libmongoc-1.0.dll') {
+          foreach ($name in "$env:BSON_NAME.dll", "$env:MONGOC_NAME.dll") {
             $version = (Get-Item "$bin\$name").VersionInfo.ProductVersion
             if ($version -ne $env:MONGOC_VERSION) { throw "$name reports version $version" }
           }
@@ -265,9 +275,15 @@ jobs:
           $smoke = Join-Path $env:RUNNER_TEMP 'smoke'
           New-Item -ItemType Directory $smoke -Force | Out-Null
           Copy-Item "$pkg\bin\*.dll" $smoke
+          # include\libbson-1.0 on 1.x, include\bson-<version> on 2.x
+          $includes = foreach ($header in 'bson\bson.h', 'mongoc\mongoc.h') {
+            $dir = Get-ChildItem "$pkg\include" -Directory | Where-Object { Test-Path (Join-Path $_.FullName $header) }
+            if (@($dir).Count -ne 1) { throw "Expected one include directory with $header" }
+            "/I$($dir.FullName)"
+          }
           Push-Location $smoke
-          cl /nologo /W3 /std:c11 "/I$pkg\include\libbson-1.0" "/I$pkg\include\libmongoc-1.0" "$env:GITHUB_WORKSPACE\test\smoke.c" `
-            /link "/LIBPATH:$pkg\lib" libmongoc-1.0.lib libbson-1.0.lib
+          cl /nologo /W3 /std:c11 @includes "$env:GITHUB_WORKSPACE\test\smoke.c" `
+            /link "/LIBPATH:$pkg\lib" "$env:MONGOC_NAME.lib" "$env:BSON_NAME.lib"
 
           $mongod = Get-ChildItem 'C:\Program Files\MongoDB\Server\*\bin\mongod.exe' | Sort-Object FullName | Select-Object -Last 1
           if (-not $mongod) { throw 'mongod was not found on the runner' }
@@ -332,9 +348,10 @@ jobs:
             exit 1
           fi
 
+      # Only this version: the weekly check builds 1.x and 2.x in the same workflow run.
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          pattern: libmongoc-windows-*
+          pattern: libmongoc-windows-${{ inputs.mongoc-version }}-*
           path: dist
           merge-multiple: true
 
@@ -358,9 +375,18 @@ jobs:
       - name: Publish the release
         run: |
           set -euo pipefail
+          # 2.x is the current branch and gets the "Latest" badge; 1.x releases are listed without it.
+          if [[ "$MONGOC_VERSION" == 1.* ]]; then
+            latest=false
+            dlls='`libmongoc-1.0.dll` and `libbson-1.0.dll`, the lib-prefixed names that Delphi FireDAC loads'
+          else
+            latest=true
+            dlls='`mongoc2.dll` and `bson2.dll`'
+          fi
           {
             echo "Unofficial Windows build of [mongo-c-driver $MONGOC_VERSION](https://github.com/mongodb/mongo-c-driver/releases/tag/$MONGOC_VERSION), for x64 and x86."
             echo
+            echo "- DLLs: $dlls"
             echo "- OpenSSL $OPENSSL_VERSION"
             echo "- $(cat dist/toolchain-x64.txt)"
             echo
@@ -372,5 +398,5 @@ jobs:
             echo '```'
           } > notes.md
           gh release create "$TAG" dist/libmongoc-windows-*.zip dist/SHA256SUMS \
-            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --latest="$latest" \
             --title "libmongoc $MONGOC_VERSION" --notes-file notes.md

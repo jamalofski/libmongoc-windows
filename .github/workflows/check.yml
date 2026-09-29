@@ -16,25 +16,30 @@ jobs:
       contents: read
       actions: write
     outputs:
-      version: ${{ steps.latest.outputs.version }}
+      versions: ${{ steps.latest.outputs.versions }}
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
-      - name: Find the latest upstream 1.x release
+      - name: Find the latest upstream 1.x and 2.x releases
         id: latest
         run: |
           set -euo pipefail
-          latest=$(gh api --paginate 'repos/mongodb/mongo-c-driver/releases?per_page=100' \
-            --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name' \
-            | grep -E '^1\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1)
-          echo "Latest upstream 1.x release: $latest"
-          if [ "$(gh api "repos/$GITHUB_REPOSITORY" --jq .private)" != "false" ]; then
-            echo "::notice::The repository is private: nothing is published."
-          elif gh release view "v$latest" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
-            echo "v$latest is already published."
-          else
-            echo "version=$latest" >> "$GITHUB_OUTPUT"
-          fi
+          tags=$(gh api --paginate 'repos/mongodb/mongo-c-driver/releases?per_page=100' \
+            --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name')
+          private=$(gh api "repos/$GITHUB_REPOSITORY" --jq .private)
+          missing=()
+          for major in 1 2; do
+            latest=$(grep -E "^$major\.[0-9]+\.[0-9]+$" <<< "$tags" | sort -V | tail -n 1)
+            echo "Latest upstream $major.x release: $latest"
+            if [ "$private" != "false" ]; then
+              echo "::notice::The repository is private: $latest is not published."
+            elif gh release view "v$latest" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+              echo "v$latest is already published."
+            else
+              missing+=("$latest")
+            fi
+          done
+          echo "versions=$(jq -cn '$ARGS.positional' --args "${missing[@]}")" >> "$GITHUB_OUTPUT"
 
       # GitHub disables scheduled workflows after 60 days without repository activity.
       - name: Keep the schedule enabled
@@ -42,10 +47,14 @@ jobs:
 
   build:
     needs: check
-    if: needs.check.outputs.version != ''
+    if: needs.check.outputs.versions != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ${{ fromJSON(needs.check.outputs.versions) }}
     uses: ./.github/workflows/build.yml
     with:
-      mongoc-version: ${{ needs.check.outputs.version }}
+      mongoc-version: ${{ matrix.version }}
       publish: true
     permissions:
       contents: write
