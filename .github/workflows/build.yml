@@ -134,7 +134,6 @@ jobs:
             if ($before[$name] -ne $vcvars[$name]) { "$name=$($vcvars[$name])" >> $env:GITHUB_ENV }
           }
           $display = & $vswhere -latest -products * -property catalog_productDisplayVersion
-          "VS_DISPLAY_VERSION=$display" >> $env:GITHUB_ENV
           Write-Host "MSVC $($vcvars['VCToolsVersion']) from Visual Studio $display"
 
       - name: Download and verify mongo-c-driver ${{ inputs.mongoc-version }}
@@ -242,6 +241,12 @@ jobs:
           New-Item -ItemType Directory "$pkg\bin", "$pkg\licenses\mongo-c-driver", "$pkg\licenses\openssl" -Force | Out-Null
           Copy-Item "stage\bin\$env:BSON_NAME.dll", "stage\bin\$env:MONGOC_NAME.dll" "$pkg\bin"
           Copy-Item "$env:OPENSSL_PREFIX\bin\$env:SSL_DLL", "$env:OPENSSL_PREFIX\bin\$env:CRYPTO_DLL" "$pkg\bin"
+          # The Visual C++ runtime that the four DLLs import is not part of Windows, so it ships with them.
+          # It comes from the Visual Studio of the image, newer than the pinned toolset: a runtime serves
+          # the binaries of its own toolset and of the older ones, back to Visual Studio 2015.
+          $runtime = @(Get-Item (Join-Path $env:VCToolsRedistDir "$env:ARCH\Microsoft.VC*.CRT\vcruntime140.dll") -ErrorAction SilentlyContinue)
+          if ($runtime.Count -ne 1) { throw "Expected one $env:ARCH vcruntime140.dll in $env:VCToolsRedistDir" }
+          Copy-Item $runtime[0].FullName "$pkg\bin"
           Copy-Item stage\include "$pkg\include" -Recurse
           Copy-Item stage\lib "$pkg\lib" -Recurse
           # share\mongo-c-driver on 1.x, share\mongo-c-driver\<version> on 2.x
@@ -264,7 +269,9 @@ jobs:
             $deps = @(dumpbin /nologo /dependents $dll.FullName | Where-Object { $_ -match '^\s+\S+\.dll$' } | ForEach-Object { $_.Trim() })
             Write-Host "$($dll.Name) ($($dll.VersionInfo.ProductVersion)) -> $($deps -join ', ')"
             foreach ($dep in $deps) {
-              if ($shipped -contains $dep -or $dep -like 'api-ms-win-*' -or (Test-Path (Join-Path $windows $dep))) { continue }
+              if ($shipped -contains $dep -or $dep -like 'api-ms-win-*') { continue }
+              # The runner has the Visual C++ runtime in its Windows directory; a user's machine may not.
+              if ($dep -notmatch '^(vcruntime|msvcp|concrt|vcomp)' -and (Test-Path (Join-Path $windows $dep))) { continue }
               throw "$($dll.Name) depends on $dep, which is neither in the package nor part of Windows"
             }
             if ($dll.Name -eq "$env:MONGOC_NAME.dll") {
@@ -280,6 +287,10 @@ jobs:
           foreach ($name in $env:SSL_DLL, $env:CRYPTO_DLL) {
             $version = (Get-Item "$bin\$name").VersionInfo.ProductVersion
             if ($version -ne $env:OPENSSL_VERSION) { throw "$name reports version $version" }
+          }
+          $runtime = (Get-Item "$bin\vcruntime140.dll").VersionInfo
+          if ([version]::new($runtime.FileMajorPart, $runtime.FileMinorPart) -lt [version]$env:MSVC_TOOLSET) {
+            throw "vcruntime140.dll $($runtime.FileVersion) is older than the MSVC $env:MSVC_TOOLSET toolset"
           }
 
       - name: Create TLS test certificates
@@ -358,7 +369,9 @@ jobs:
           Push-Location pkg
           7z a -tzip -mx=9 "..\dist\$env:PKG.zip" $env:PKG | Out-Null
           Pop-Location
-          "MSVC $env:VCToolsVersion (Visual Studio $env:VS_DISPLAY_VERSION), GitHub runner image $env:ImageOS $env:ImageVersion" |
+          $runtime = (Get-Item "pkg\$env:PKG\bin\vcruntime140.dll").VersionInfo.FileVersion
+          # The toolset, not the Visual Studio that hosts it: that one is newer and does not compile the DLLs.
+          "MSVC $env:VCToolsVersion toolset, Visual C++ runtime $runtime, GitHub runner image $env:ImageOS $env:ImageVersion" |
             Set-Content "dist\toolchain-$env:ARCH.txt"
           Get-ChildItem dist | Format-Table Name, Length
 
@@ -431,7 +444,7 @@ jobs:
             echo "- OpenSSL $OPENSSL_VERSION"
             echo "- $(cat dist/toolchain-x64.txt)"
             echo
-            echo "Copy the four DLLs from \`bin/\` next to your executable. The [README](https://github.com/$GITHUB_REPOSITORY#readme) lists the requirements and how to verify the files:"
+            echo "Copy the DLLs from \`bin/\` next to your executable. The [README](https://github.com/$GITHUB_REPOSITORY#readme) lists the requirements and how to verify the files:"
             echo
             echo '```sh'
             echo 'sha256sum -c SHA256SUMS'

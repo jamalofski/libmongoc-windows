@@ -29,6 +29,7 @@ Each zip contains:
 ```
 bin/        the two driver DLLs (see above)
             libssl-3-x64.dll, libcrypto-3-x64.dll   (x86: libssl-3.dll, libcrypto-3.dll)
+            vcruntime140.dll, the Microsoft Visual C++ runtime
 include/    libbson and libmongoc headers
 lib/        import libraries (1.x: libmongoc-1.0.lib, libbson-1.0.lib; 2.x: mongoc2.dll.lib, bson2.dll.lib),
             CMake and pkg-config files
@@ -37,9 +38,9 @@ licenses/   mongo-c-driver and its bundled components, OpenSSL
 
 ## Usage
 
-Copy the four DLLs from `bin/` next to your executable. The driver DLL imports the OpenSSL DLLs when it loads, so they are needed even if you never use TLS, and they must be OpenSSL 3.5 or later. If your application already ships OpenSSL 3.5 or later under the same file names, you can keep yours.
+Copy the DLLs from `bin/` next to your executable. The driver DLL imports the OpenSSL DLLs when it loads, so they are needed even if you never use TLS, and they must be OpenSSL 3.5 or later. If your application already ships OpenSSL 3.5 or later under the same file names, you can keep yours.
 
-The DLLs need the [Microsoft Visual C++ Redistributable](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist) for the same architecture, which most machines already have.
+`vcruntime140.dll` is the only thing the DLLs need that Windows 10 and 11 do not include. It normally comes with the [Microsoft Visual C++ Redistributable](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist), and the copy in the package makes the DLLs load on machines that do not have it. Every Visual Studio since 2015 uses this file name, and a newer runtime runs what an older compiler built: leave the file out if you install the redistributable (14.44 or later) with your application, and do not replace a newer `vcruntime140.dll` with it.
 
 For C and C++ projects, add the two directories under `include/` to the include path and link the two import libraries from `lib/`, or add the extracted folder to `CMAKE_PREFIX_PATH`.
 
@@ -55,24 +56,24 @@ gh attestation verify mongoc2.dll --repo jamalofski/libmongoc-windows
 
 ## How it is built
 
-[`build.yml`](.github/workflows/build.yml) runs on a GitHub-hosted `windows-2025` runner, with the MSVC 14.44 toolset from Visual Studio 2022 17.14:
+[`build.yml`](.github/workflows/build.yml) runs on a GitHub-hosted `windows-2025` runner. The runner has Visual Studio 2026, but the DLLs are compiled with the MSVC 14.44 toolset from Visual Studio 2022 17.14, which it installs side by side:
 
 1. It downloads the mongo-c-driver release and checks its signature against the [MongoDB C Driver release key](keys/mongo-c-driver.asc) (`6DB5 5D82 23FF 44E4 9DCB 9813 44E7 6C05 65AB C463`).
 2. It builds OpenSSL from the latest 3.5 LTS release, after checking the tarball signature against the [OpenSSL signing certificate](keys/openssl.asc) (`B146 647E 45A7 B339 47AB 226B 2A2C 87D1 6169 2D40`), with OpenSSL's default Windows directories.
 3. It builds libbson and libmongoc with `ENABLE_SSL=OPENSSL`, `ENABLE_SASL=SSPI`, `ENABLE_SRV=ON`, `ENABLE_ZLIB=BUNDLED`, `ENABLE_MONGODB_AWS_AUTH=ON`, `ENABLE_SNAPPY=OFF`, `ENABLE_ZSTD=OFF` and `ENABLE_CLIENT_SIDE_ENCRYPTION=OFF`. On 1.x it adds `BSON_OUTPUT_BASENAME=libbson` and `MONGOC_OUTPUT_BASENAME=libmongoc`.
-4. It checks the architecture and version of every DLL, and that each dependency is either in the package or part of Windows.
+4. It adds `vcruntime140.dll` from the runner's Visual Studio, then checks the architecture and version of every DLL, and that each dependency is either in the package or part of Windows.
 5. It compiles a [smoke test](test/smoke.c) and runs it with only the package and Windows on the DLL search path, against a local `mongod` that requires TLS and a client certificate.
 
 [`check.yml`](.github/workflows/check.yml) looks for new upstream 1.x and 2.x releases every week and builds and publishes them the same way.
 
 ## Versions
 
-Release tags follow upstream: `v2.5.5` is mongo-c-driver 2.5.5 and `v1.30.12` is mongo-c-driver 1.30.12. Each release lists the OpenSSL and compiler versions it was built with.
+Release tags follow upstream: `v2.5.5` is mongo-c-driver 2.5.5 and `v1.30.12` is mongo-c-driver 1.30.12. Each release lists the OpenSSL, compiler and Visual C++ runtime versions it was built with.
 
 Only new mongo-c-driver releases trigger a build, and each build takes the latest OpenSSL 3.5 release available at that time. A new OpenSSL release on its own does not produce a new package.
 
 ## License
 
-The build scripts in this repository are under the [MIT license](LICENSE). The binaries are distributed under their own licenses, included in each zip: Apache License 2.0 for the MongoDB C Driver and for OpenSSL, plus the notices of the code bundled in the driver.
+The build scripts in this repository are under the [MIT license](LICENSE). The binaries are distributed under their own licenses, included in each zip: Apache License 2.0 for the MongoDB C Driver and for OpenSSL, plus the notices of the code bundled in the driver. `vcruntime140.dll` is a Microsoft file, redistributed unmodified under the Visual Studio license terms.
 
 MongoDB is a trademark of MongoDB, Inc.
