@@ -50,7 +50,7 @@ Each release comes with a `SHA256SUMS` file and a [build provenance attestation]
 
 ```sh
 sha256sum -c SHA256SUMS
-gh attestation verify libmongoc-windows-2.5.5-x64.zip --repo jamalofski/libmongoc-windows
+gh attestation verify libmongoc-windows-<version>-x64.zip --repo jamalofski/libmongoc-windows
 gh attestation verify mongoc2.dll --repo jamalofski/libmongoc-windows
 ```
 
@@ -68,7 +68,7 @@ gh attestation verify mongoc2.dll --repo jamalofski/libmongoc-windows
 
 ## Versions
 
-Release tags follow upstream: `v2.5.5` is mongo-c-driver 2.5.5 and `v1.30.12` is mongo-c-driver 1.30.12. Each release lists the OpenSSL, compiler and Visual C++ runtime versions it was built with.
+Release tags follow upstream: the release tagged `v<version>` is built from mongo-c-driver `<version>`. Each release lists the OpenSSL, compiler and Visual C++ runtime versions it was built with.
 
 Only new mongo-c-driver releases trigger a build, and each build takes the latest OpenSSL 3.5 release available at that time. A new OpenSSL release on its own does not produce a new package.
 
